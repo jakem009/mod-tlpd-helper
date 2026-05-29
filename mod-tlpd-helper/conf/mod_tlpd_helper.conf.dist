@@ -1,0 +1,38 @@
+################################################################################
+# mod-tlpd-helper configuration
+# Manages Time-Lost Proto-Drake (entry 32491) and Vyragosa (entry 32630) spawns.
+################################################################################
+
+[worldserver]
+
+###################################################################################################
+# MOD-TLPD-HELPER
+#
+#    TLPDHelper.Enable
+#        Description: Enable or disable the entire module.
+#        Default:     1 (enabled)
+
+TLPDHelper.Enable = 1
+
+#    TLPDHelper.AnnounceOnSpawn
+#        Description: Broadcast a server-wide message when TLPD or Vyragosa
+#                     becomes visible (i.e. their hidden timer expires).
+#        Default:     1 (enabled)
+
+TLPDHelper.AnnounceOnSpawn = 1
+
+#    TLPDHelper.SpawnTimerMinHours
+#        Description: Minimum hours before TLPD/Vyragosa becomes visible after
+#                     entering the world.  Replaces the vanilla minimum of 6 h.
+#        Range:       Must be <= SpawnTimerMaxHours (values are swapped if not).
+#        Default:     6
+
+TLPDHelper.SpawnTimerMinHours = 6
+
+#    TLPDHelper.SpawnTimerMaxHours
+#        Description: Maximum hours before TLPD/Vyragosa becomes visible after
+#                     entering the world.  Replaces the vanilla maximum of 22 h.
+#        Range:       Must be >= SpawnTimerMinHours.
+#        Default:     22
+
+TLPDHelper.SpawnTimerMaxHours = 22
