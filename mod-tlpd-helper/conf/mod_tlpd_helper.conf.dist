@@ -17,22 +17,31 @@ TLPDHelper.Enable = 1
 #    TLPDHelper.AnnounceOnSpawn
 #        Description: Broadcast a server-wide message when TLPD or Vyragosa
 #                     becomes visible (i.e. their hidden timer expires).
-#        Default:     1 (enabled)
+#        Default:     0 (disabled)
 
-TLPDHelper.AnnounceOnSpawn = 1
+TLPDHelper.AnnounceOnSpawn = 0
 
-#    TLPDHelper.SpawnTimerMinHours
-#        Description: Minimum hours before TLPD/Vyragosa becomes visible after
-#                     entering the world.  Replaces the vanilla minimum of 6 h.
-#        Range:       Must be <= SpawnTimerMaxHours (values are swapped if not).
-#        Default:     6
+#    TLPDHelper.SpawnTimerMinSeconds
+#        Description: Minimum seconds before TLPD/Vyragosa becomes visible after
+#                     entering the world.
+#                     Set both Min and Max to 0 to use the default server behaviour:
+#                     urand(0, 57600) seconds (0-16h), which combined with the 6h
+#                     pool spawntimesecs gives a 6-22h total respawn range.
+#        Default:     0 (use server default)
 
-TLPDHelper.SpawnTimerMinHours = 6
+TLPDHelper.SpawnTimerMinSeconds = 0
 
-#    TLPDHelper.SpawnTimerMaxHours
-#        Description: Maximum hours before TLPD/Vyragosa becomes visible after
-#                     entering the world.  Replaces the vanilla maximum of 22 h.
-#        Range:       Must be >= SpawnTimerMinHours.
-#        Default:     22
+#    TLPDHelper.SpawnTimerMaxSeconds
+#        Description: Upper bound of the seconds-based timer.
+#                     Set both Min and Max to 0 to use the server default.
+#        Default:     0 (use server default)
 
-TLPDHelper.SpawnTimerMaxHours = 22
+TLPDHelper.SpawnTimerMaxSeconds = 0
+
+#    TLPDHelper.PoolRespawnSeconds
+#        Description: Must match creature.spawntimesecs for TLPD/Vyragosa in the DB.
+#                     Used by .tlpd nextspawn to estimate the next visible window
+#                     after a death.
+#        Default:     45 (temp test value - restore to 21600 before going live)
+
+TLPDHelper.PoolRespawnSeconds = 45

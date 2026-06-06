@@ -3,16 +3,17 @@
  *
  * Intercepts TLPD (32491) and Vyragosa (32630) spawns so that the
  * spawn-visibility timer can be configured.  Also provides GM commands:
- *   .tlpd status                                    – see state of each tracked creature
- *   .tlpd reveal [tlpd|vyragosa|both]               – make hidden creature(s) visible now
- *   .tlpd log [tlpd|vyragosa|both]                  – show last-visible + last-death times (persisted in DB across restarts)
- *   .tlpd spawns                                    – list all DB spawn slots with their 1-based indices
+ *   .tlpd status                                    - see state of each tracked creature
+ *   .tlpd reveal [tlpd|vyragosa|both]               - make hidden creature(s) visible now
+ *   .tlpd log [tlpd|vyragosa|both]                  - show last-visible + last-death times (persisted in DB across restarts)
+ *   .tlpd spawns                                    - list all DB spawn slots with their 1-based indices
  *   .tlpd forcespawn <tlpd|vyragosa> [<slot>] [instant] [forced]
- *                                                   – summon a new creature into the spawn cycle;
+ *                                                   - summon a new creature into the spawn cycle;
  *                                                     <slot> targets a specific slot (see .tlpd spawns);
  *                                                     "instant" skips the hide timer;
  *                                                     "forced" spawns even if one is already active
- *   .tlpd teleport <guid>                           – teleport to a tracked creature by guid
+ *   .tlpd nextspawn [tlpd|vyragosa|both]            - show estimated next spawn/reveal window
+ *   .tlpd teleport <guid>                           - teleport to a tracked creature by guid
  */
 
 #include "AllCreatureScript.h"
@@ -47,27 +48,34 @@ using namespace Acore::ChatCommands;
 constexpr uint32 NPC_TIME_LOST_PROTO_DRAKE = 32491;
 constexpr uint32 NPC_VYRAGOSA             = 32630;
 
+// Matches ACTION_TLPD_REVEAL in zone_storm_peaks.cpp
+constexpr int32 ACTION_TLPD_REVEAL = 1;
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 namespace TLPDHelperConfig
 {
-    bool   Enable             = true;
-    bool   AnnounceOnSpawn    = false;
-    uint32 SpawnTimerMinHours = 6;
-    uint32 SpawnTimerMaxHours = 22;
+    bool   Enable               = true;
+    bool   AnnounceOnSpawn      = false;
+    uint32 SpawnTimerMinSeconds = 0;
+    uint32 SpawnTimerMaxSeconds = 0;
+    // Must match creature.spawntimesecs for TLPD/Vyragosa so that .tlpd nextspawn
+    // can accurately estimate the pool-respawn window after a death.
+    uint32 PoolRespawnSeconds   = 21600;
 
     void Load()
     {
-        Enable             = sConfigMgr->GetOption<bool>  ("TLPDHelper.Enable",             true);
-        AnnounceOnSpawn    = sConfigMgr->GetOption<bool>  ("TLPDHelper.AnnounceOnSpawn",    false);
-        SpawnTimerMinHours = sConfigMgr->GetOption<uint32>("TLPDHelper.SpawnTimerMinHours", 6);
-        SpawnTimerMaxHours = sConfigMgr->GetOption<uint32>("TLPDHelper.SpawnTimerMaxHours", 22);
+        Enable               = sConfigMgr->GetOption<bool>  ("TLPDHelper.Enable",               true);
+        AnnounceOnSpawn      = sConfigMgr->GetOption<bool>  ("TLPDHelper.AnnounceOnSpawn",      false);
+        SpawnTimerMinSeconds = sConfigMgr->GetOption<uint32>("TLPDHelper.SpawnTimerMinSeconds", 0);
+        SpawnTimerMaxSeconds = sConfigMgr->GetOption<uint32>("TLPDHelper.SpawnTimerMaxSeconds", 0);
+        PoolRespawnSeconds   = sConfigMgr->GetOption<uint32>("TLPDHelper.PoolRespawnSeconds",   21600);
 
-        if (SpawnTimerMinHours > SpawnTimerMaxHours)
+        if (SpawnTimerMinSeconds > SpawnTimerMaxSeconds && SpawnTimerMinSeconds > 0)
         {
-            LOG_WARN("module", "mod-tlpd-helper: SpawnTimerMinHours > SpawnTimerMaxHours - swapping values.");
-            std::swap(SpawnTimerMinHours, SpawnTimerMaxHours);
+            LOG_WARN("module", "mod-tlpd-helper: SpawnTimerMinSeconds > SpawnTimerMaxSeconds - swapping values.");
+            std::swap(SpawnTimerMinSeconds, SpawnTimerMaxSeconds);
         }
     }
 } // namespace TLPDHelperConfig
@@ -140,28 +148,14 @@ public:
 
     void RecordVisible(uint32 entry)
     {
-        time_t const now = time(nullptr);
-        {
-            std::lock_guard<std::mutex> lock(_mutex);
-            _lastVisible[entry] = now;
-        }
-        WorldDatabase.Execute(
-            "INSERT INTO `mod_tlpd_helper_spawn_log` (`entry`, `last_visible_time`) "
-            "VALUES ({}, {}) ON DUPLICATE KEY UPDATE `last_visible_time` = {}",
-            entry, (uint32)now, (uint32)now);
+        std::lock_guard<std::mutex> lock(_mutex);
+        _lastVisible[entry] = time(nullptr);
     }
 
     void RecordDeath(uint32 entry)
     {
-        time_t const now = time(nullptr);
-        {
-            std::lock_guard<std::mutex> lock(_mutex);
-            _lastDeath[entry] = now;
-        }
-        WorldDatabase.Execute(
-            "INSERT INTO `mod_tlpd_helper_spawn_log` (`entry`, `last_death_time`) "
-            "VALUES ({}, {}) ON DUPLICATE KEY UPDATE `last_death_time` = {}",
-            entry, (uint32)now, (uint32)now);
+        std::lock_guard<std::mutex> lock(_mutex);
+        _lastDeath[entry] = time(nullptr);
     }
 
     // Returns nullopt if the entry has never become visible (even across restarts).
@@ -178,32 +172,6 @@ public:
         std::lock_guard<std::mutex> lock(_mutex);
         auto it = _lastDeath.find(entry);
         return (it != _lastDeath.end()) ? Optional<time_t>{it->second} : std::nullopt;
-    }
-
-    // Called once at startup from OnLoadCustomDatabaseTable.
-    void LoadFromDB()
-    {
-        QueryResult result = WorldDatabase.Query(
-            "SELECT `entry`, `last_visible_time`, `last_death_time` "
-            "FROM `mod_tlpd_helper_spawn_log`");
-        if (!result)
-            return;
-
-        std::lock_guard<std::mutex> lock(_mutex);
-        do
-        {
-            Field* fields        = result->Fetch();
-            uint32  entry        = fields[0].Get<uint32>();
-            uint32  visibleRaw   = fields[1].Get<uint32>();
-            uint32  deathRaw     = fields[2].Get<uint32>();
-
-            if (visibleRaw)
-                _lastVisible[entry] = static_cast<time_t>(visibleRaw);
-            if (deathRaw)
-                _lastDeath[entry]   = static_cast<time_t>(deathRaw);
-        } while (result->NextRow());
-
-        LOG_INFO("module", "mod-tlpd-helper: loaded spawn log from DB.");
     }
 
     // Returns a snapshot so callers can iterate without holding the lock.
@@ -267,10 +235,10 @@ private:
 struct NamedSpawn { float x, y; char const* name; };
 static NamedSpawn const kNamedSpawns[] =
 {
-    { 6748.21f,  -1664.31f, "Brunnhildar"       },
+    { 6821.0693f, -1800.8033f, "Brunnhildar"     },
     { 6455.72f,   -562.87f, "Waterfall (path2)" },
-    { 6481.93f,   -689.97f, "Waterfall (path3)" },
-    { 6954.76f,   -472.38f, "Frozen Lake"       },
+    { 6550.9775f, -671.7839f, "Waterfall (path3)" },
+    { 6880.4116f, -398.9924f, "Frozen Lake"     },
     { 8545.776f, -1879.396f, "Ulduar"           },
 };
 
@@ -316,19 +284,31 @@ public:
         // and replace it with our configured range.
         creature->m_Events.KillAllEvents(false);
 
-        uint32 const minH        = TLPDHelperConfig::SpawnTimerMinHours;
-        uint32 const maxH        = TLPDHelperConfig::SpawnTimerMaxHours;
-        uint32 const delayHours  = (minH >= maxH) ? minH : urand(minH, maxH);
         bool   const announce    = TLPDHelperConfig::AnnounceOnSpawn;
         std::string  name        = creature->GetName();
         uint32 const entry       = creature->GetEntry();
         ObjectGuid const cGuid   = creature->GetGUID();
 
+        uint32 minSecs = TLPDHelperConfig::SpawnTimerMinSeconds;
+        uint32 maxSecs = TLPDHelperConfig::SpawnTimerMaxSeconds;
+
+        // 0/0 means use the same formula as the core: urand(0, 16h).
+        // Combined with the 6h spawntimesecs this gives 6-22h total respawn.
+        if (minSecs == 0 && maxSecs == 0)
+            maxSecs = 60 * 60 * 16;
+
+        uint32 const delaySecs = (minSecs >= maxSecs) ? minSecs : urand(minSecs, maxSecs);
+        Milliseconds const delay    = Seconds(delaySecs);
+        time_t const revealAt       = time(nullptr) + static_cast<time_t>(delaySecs);
+
+        LOG_DEBUG("module", "mod-tlpd-helper: {} entered world, will become visible in ~{} second(s).",
+            creature->GetName(), delaySecs);
+
         creature->m_Events.AddEventAtOffset(
             [creature, announce, name, entry, cGuid]()
             {
-                creature->SetVisible(true);
-                creature->SetImmuneToAll(false);
+                if (creature->AI())
+                    creature->AI()->DoAction(ACTION_TLPD_REVEAL);
 
                 TLPDTracker::Instance().ClearRevealTime(cGuid);
                 TLPDTracker::Instance().RecordVisible(entry);
@@ -341,15 +321,20 @@ public:
                     sWorldSessionMgr->SendServerMessage(SERVER_MSG_STRING, msg);
                 }
 
-                LOG_INFO("module", "mod-tlpd-helper: {} is now visible.", name);
+                time_t const visibleAt = time(nullptr);
+                char timeBuf[32];
+                struct tm ltm{};
+#ifdef _WIN32
+                localtime_s(&ltm, &visibleAt);
+#else
+                localtime_r(&visibleAt, &ltm);
+#endif
+                std::strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", &ltm);
+                LOG_INFO("module", "mod-tlpd-helper: [{}] {} is now visible.", timeBuf, name);
             },
-            Hours(delayHours));
+            delay);
 
-        TLPDTracker::Instance().SetRevealTime(creature->GetGUID(),
-            time(nullptr) + static_cast<time_t>(delayHours) * 3600);
-
-        LOG_DEBUG("module", "mod-tlpd-helper: {} entered world, will become visible in ~{} hour(s).",
-            creature->GetName(), delayHours);
+        TLPDTracker::Instance().SetRevealTime(creature->GetGUID(), revealAt);
     }
 
     void OnCreatureRemoveWorld(Creature* creature) override
@@ -403,6 +388,7 @@ public:
             { "reveal",     HandleTLPDRevealCommand,     rbac::RBAC_PERM_COMMAND_NPC_ADD, Console::No },
             { "status",     HandleTLPDStatusCommand,     rbac::RBAC_PERM_COMMAND_NPC_ADD, Console::No },
             { "log",        HandleTLPDLogCommand,        rbac::RBAC_PERM_COMMAND_NPC_ADD, Console::No },
+            { "nextspawn",  HandleTLPDNextSpawnCommand,  rbac::RBAC_PERM_COMMAND_NPC_ADD, Console::No },
             { "spawns",     HandleTLPDSpawnsCommand,     rbac::RBAC_PERM_COMMAND_NPC_ADD, Console::No },
             { "forcespawn", HandleTLPDForceSpawnCommand, rbac::RBAC_PERM_COMMAND_NPC_ADD, Console::No },
             { "teleport",   HandleTLPDTeleportCommand,   rbac::RBAC_PERM_COMMAND_NPC_ADD, Console::No },
@@ -471,8 +457,7 @@ public:
             if (!c->IsVisible())
             {
                 c->m_Events.KillAllEvents(false);
-                c->SetVisible(true);
-                c->SetImmuneToAll(false);
+                c->AI()->DoAction(ACTION_TLPD_REVEAL);
                 TLPDTracker::Instance().ClearRevealTime(c->GetGUID());
                 handler->PSendSysMessage("{} has been revealed!", c->GetName());
                 ++revealed;
@@ -548,9 +533,10 @@ public:
             else
                 stateStr = "VISIBLE \u2013 up for grabs!";
 
-            handler->PSendSysMessage("[{}] entry={} guid={} | {}",
-                c->GetName(), c->GetEntry(), guid.GetCounter(), stateStr);
-            handler->PSendSysMessage("  |cff00ccffTo teleport: .go xyz {:.2f} {:.2f} {:.2f} 571|r",
+            handler->PSendSysMessage("[{}] entry={} guid={} | {} | {}",
+                c->GetName(), c->GetEntry(), guid.GetCounter(),
+                TLPDTracker::Instance().GetSpawnName(guid), stateStr);
+            handler->PSendSysMessage(".go xyz {:.2f} {:.2f} {:.2f} 571",
                 c->GetPositionX(), c->GetPositionY(), c->GetPositionZ());
         }
 
@@ -630,6 +616,176 @@ public:
             printEntry("TLPD",     NPC_TIME_LOST_PROTO_DRAKE);
         if (doVyragosa)
             printEntry("Vyragosa", NPC_VYRAGOSA);
+
+        return true;
+    }
+
+    // .tlpd nextspawn [tlpd|vyragosa|both]
+    // Shows the estimated next spawn/reveal window for TLPD and/or Vyragosa.
+    // - Visible: says so immediately.
+    // - Hidden with tracked reveal time: shows exact countdown.
+    // - Dead / between pool cycles: estimates from last death + PoolRespawnSeconds + reveal range.
+    static bool HandleTLPDNextSpawnCommand(ChatHandler* handler, Optional<std::string> which)
+    {
+        if (!TLPDHelperConfig::Enable)
+        {
+            handler->SendErrorMessage("mod-tlpd-helper is disabled.");
+            return false;
+        }
+
+        bool doTLPD     = true;
+        bool doVyragosa = true;
+
+        if (which)
+        {
+            std::string target = *which;
+            std::transform(target.begin(), target.end(), target.begin(), ::tolower);
+            if (target == "tlpd")
+                doVyragosa = false;
+            else if (target == "vyragosa")
+                doTLPD = false;
+            else if (target != "both")
+            {
+                handler->SendErrorMessage("Usage: .tlpd nextspawn [tlpd|vyragosa|both]");
+                return false;
+            }
+        }
+
+        Map* northrend   = sMapMgr->FindBaseNonInstanceMap(MAP_NORTHREND);
+        time_t const now = time(nullptr);
+
+        auto fmtWallClock = [](time_t t) -> std::string
+        {
+            char buf[32];
+            struct tm ltm{};
+#ifdef _WIN32
+            localtime_s(&ltm, &t);
+#else
+            localtime_r(&t, &ltm);
+#endif
+            std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ltm);
+            return buf;
+        };
+
+        // Returns "Xh Ym Zs" with seconds precision for countdown displays.
+        auto fmtCountdown = [](time_t diff) -> std::string
+        {
+            if (diff <= 0)
+                return "now";
+            if (diff < 60)
+                return Acore::StringFormat("{}s", diff);
+            if (diff < 3600)
+                return Acore::StringFormat("{}m {}s", diff / 60, diff % 60);
+            return Acore::StringFormat("{}h {}m {}s", diff / 3600, (diff % 3600) / 60, diff % 60);
+        };
+
+        auto fmtElapsed = [](time_t elapsed) -> std::string
+        {
+            if (elapsed < 60)
+                return Acore::StringFormat("{}s ago", elapsed);
+            if (elapsed < 3600)
+                return Acore::StringFormat("{}m ago", elapsed / 60);
+            return Acore::StringFormat("{}h {}m ago", elapsed / 3600, (elapsed % 3600) / 60);
+        };
+
+        // --- Per-NPC: report visible / hidden creatures that are currently tracked ---
+        auto guids      = TLPDTracker::Instance().Snapshot();
+        bool tlpdHandled = false;
+        bool vyraHandled = false;
+
+        for (ObjectGuid const& guid : guids)
+        {
+            Creature* c = northrend ? northrend->GetCreature(guid) : nullptr;
+            if (!c)
+                continue;
+
+            bool const isTLPD = (c->GetEntry() == NPC_TIME_LOST_PROTO_DRAKE);
+            bool const isVyra = (c->GetEntry() == NPC_VYRAGOSA);
+
+            if (!doTLPD && isTLPD) continue;
+            if (!doVyragosa && isVyra) continue;
+
+            char const* label = isTLPD ? "TLPD" : "Vyragosa";
+
+            if (c->IsVisible())
+            {
+                handler->PSendSysMessage(
+                    "|cff00ff00[{}]|r VISIBLE NOW at '{}' (guid={}). Get in there!",
+                    label, TLPDTracker::Instance().GetSpawnName(guid), guid.GetCounter());
+            }
+            else
+            {
+                auto revealTime = TLPDTracker::Instance().GetRevealTime(guid);
+                if (revealTime && *revealTime > now)
+                {
+                    handler->PSendSysMessage(
+                        "|cffffff00[{}]|r Hidden at '{}' - reveals in {} (at {}).",
+                        label, TLPDTracker::Instance().GetSpawnName(guid),
+                        fmtCountdown(*revealTime - now), fmtWallClock(*revealTime));
+                }
+                else
+                    handler->PSendSysMessage("|cffffff00[{}]|r Hidden - reveal is imminent.", label);
+            }
+
+            if (isTLPD) tlpdHandled = true;
+            if (isVyra) vyraHandled = true;
+        }
+
+        // --- Dead / between pool cycles: show the spawn window ONCE for the pair ---
+        // Skip entirely if any creature is already tracked - the pool is active and the
+        // status lines above already tell the full story. Use .tlpd log for death history.
+        if (tlpdHandled || vyraHandled)
+            return true;
+
+        // Use whichever entry died most recently as the reference death time.
+        auto tlpdDeath   = TLPDTracker::Instance().GetLastDeath(NPC_TIME_LOST_PROTO_DRAKE);
+        auto vyraDeath   = TLPDTracker::Instance().GetLastDeath(NPC_VYRAGOSA);
+        Optional<time_t> lastDeath;
+        char const* deadLabel = "TLPD/Vyragosa";
+
+        if (tlpdDeath && vyraDeath)
+        {
+            if (*tlpdDeath >= *vyraDeath) { lastDeath = tlpdDeath; deadLabel = "TLPD"; }
+            else                          { lastDeath = vyraDeath; deadLabel = "Vyragosa"; }
+        }
+        else if (tlpdDeath) { lastDeath = tlpdDeath; deadLabel = "TLPD"; }
+        else if (vyraDeath) { lastDeath = vyraDeath; deadLabel = "Vyragosa"; }
+
+        if (!lastDeath)
+        {
+            handler->PSendSysMessage(
+                "|cffaaaaaa[TLPD/Vyragosa]|r No death on record - creature may be on its initial hidden timer. Try .tlpd status.");
+            return true;
+        }
+
+        time_t const poolRespawnAt = *lastDeath + static_cast<time_t>(TLPDHelperConfig::PoolRespawnSeconds);
+
+        uint32 revealMinSecs = TLPDHelperConfig::SpawnTimerMinSeconds;
+        uint32 revealMaxSecs = TLPDHelperConfig::SpawnTimerMaxSeconds;
+        if (revealMinSecs == 0 && revealMaxSecs == 0)
+            revealMaxSecs = 60 * 60 * 16;
+
+        time_t const earliestVisible = poolRespawnAt + static_cast<time_t>(revealMinSecs);
+        time_t const latestVisible   = poolRespawnAt + static_cast<time_t>(revealMaxSecs);
+
+        if (poolRespawnAt > now)
+        {
+            handler->PSendSysMessage(
+                "|cffff4444[{}]|r died {} | Pool respawns in {} (at {})",
+                deadLabel, fmtElapsed(now - *lastDeath),
+                fmtCountdown(poolRespawnAt - now), fmtWallClock(poolRespawnAt));
+        }
+        else
+        {
+            handler->PSendSysMessage(
+                "|cffff9900[{}]|r died {} | Pool respawned at {} - creature not yet tracked.",
+                deadLabel, fmtElapsed(now - *lastDeath), fmtWallClock(poolRespawnAt));
+        }
+
+        handler->PSendSysMessage(
+            "  Visible window: {} to {} (between {} and {} from now)",
+            fmtWallClock(earliestVisible), fmtWallClock(latestVisible),
+            fmtCountdown(earliestVisible - now), fmtCountdown(latestVisible - now));
 
         return true;
     }
@@ -826,17 +982,17 @@ public:
         }
 
         summon->SetTempSummonType(TEMPSUMMON_DEAD_DESPAWN);
-        // MoveWaypoint with repeatable=true creates a looping WaypointMovementGenerator,
-        // matching the behaviour of DB spawns. MovePath() is one-shot and stops at the last node.
-        summon->GetMotionMaster()->MoveWaypoint(pathId, true);
+        // Set the path so DoAction(ACTION_TLPD_REVEAL) can call MoveWaypoint(GetWaypointPath())
+        // correctly when the hide timer fires. TempSummons have no creature_addon entry so
+        // GetWaypointPath() would otherwise return 0.
+        summon->LoadPath(pathId);
 
         char const* spawnName = GetSpawnName(pos.GetPositionX(), pos.GetPositionY());
 
         if (makeInstant)
         {
             summon->m_Events.KillAllEvents(false);
-            summon->SetVisible(true);
-            summon->SetImmuneToAll(false);
+            summon->AI()->DoAction(ACTION_TLPD_REVEAL);
             handler->PSendSysMessage("{} force-spawned and made immediately visible at '{}' ({:.1f}, {:.1f}, {:.1f}).",
                 summon->GetName(), spawnName, pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ());
         }
@@ -847,7 +1003,7 @@ public:
                 summon->GetName(), spawnName, pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ());
         }
 
-        handler->PSendSysMessage("|cff00ccffTo teleport: .go xyz {:.2f} {:.2f} {:.2f} 571|r",
+        handler->PSendSysMessage(".go xyz {:.2f} {:.2f} {:.2f} 571",
             pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ());
 
         return true;
@@ -867,10 +1023,8 @@ public:
         TLPDHelperConfig::Load();
     }
 
-    // Fires during world init after DB tables exist - ideal for reading custom tables.
     void OnLoadCustomDatabaseTable() override
     {
-        TLPDTracker::Instance().LoadFromDB();
         TLPDTracker::Instance().LoadSpawnSlotsFromDB();
     }
 };
