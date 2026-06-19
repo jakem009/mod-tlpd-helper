@@ -189,7 +189,7 @@ public:
             "SELECT c.position_x, c.position_y, c.position_z, c.orientation, ca.path_id "
             "FROM creature c "
             "INNER JOIN creature_addon ca ON c.guid = ca.guid "
-            "WHERE c.id1 = {} AND c.map = {} AND c.MovementType = 2 AND ca.path_id > 0 "
+            "WHERE c.id = {} AND c.map = {} AND c.MovementType = 2 AND ca.path_id > 0 "
             "ORDER BY c.guid",
             NPC_TIME_LOST_PROTO_DRAKE, MAP_NORTHREND);
 
